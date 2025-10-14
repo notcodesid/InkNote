@@ -9,7 +9,9 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCalendarsUsageDescription": "Allow InkNote to access your calendars to add events.",
+        "NSRemindersUsageDescription": "Allow InkNote to create reminders for you."
       },
       "bundleIdentifier": "xyz.create.CreateExpoEnvironment"
     },
@@ -63,7 +65,7 @@
       }
     },
     "runtimeVersion": {
-      "policy": "appVersion"
+      "policy": "1.0.0"
     }
   }
 }
