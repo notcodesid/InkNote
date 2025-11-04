@@ -12,11 +12,6 @@ import {
 } from "@shopify/react-native-skia";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import {
-  useSharedValue,
-  withSpring,
-  runOnJS as reanimatedRunOnJS,
-} from "react-native-reanimated";
-import {
   PenTool,
   Eraser,
   Palette,
