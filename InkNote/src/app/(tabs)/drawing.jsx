@@ -6,20 +6,15 @@ import {
   Path,
   Group,
   Fill,
-  useTouchHandler,
-  useSharedValueEffect,
-  runOnJS,
+  Skia,
 } from "@shopify/react-native-skia";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import {
   PenTool,
   Eraser,
-  Palette,
   Undo,
   Redo,
   Save,
-  Settings,
-  Download,
 } from "lucide-react-native";
 import ScreenLayout from "@/components/ScreenLayout";
 import { useTheme } from "@/utils/theme";
@@ -29,33 +24,29 @@ const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
 
 export default function DrawingScreen() {
   const insets = useSafeAreaInsets();
-  const { colors, isDark } = useTheme();
+  const { colors } = useTheme();
   const [currentTool, setCurrentTool] = useState("pen");
   const [strokeWidth, setStrokeWidth] = useState(3);
   const [strokeColor, setStrokeColor] = useState(colors.strokeColor);
   const [paths, setPaths] = useState([]);
   const [undoStack, setUndoStack] = useState([]);
-  const [isDrawing, setIsDrawing] = useState(false);
+  const [redoStack, setRedoStack] = useState([]);
+  const [currentDrawingPath, setCurrentDrawingPath] = useState(null);
 
-  // Drawing state
-  const currentPath = useRef("");
-  const currentStroke = useRef({
-    color: colors.strokeColor,
-    width: 3,
-    tool: "pen",
-  });
+  // Refs for tracking current stroke
+  const currentPoints = useRef([]);
 
   // Available colors
   const availableColors = useMemo(
     () => [
-      colors.strokeColor, // Black/White
-      "#FF4444", // Red
-      "#44FF44", // Green
-      "#4444FF", // Blue
-      "#FFFF44", // Yellow
-      "#FF44FF", // Magenta
-      "#44FFFF", // Cyan
-      "#FF8844", // Orange
+      colors.strokeColor,
+      "#FF4444",
+      "#44FF44",
+      "#4444FF",
+      "#FFFF44",
+      "#FF44FF",
+      "#44FFFF",
+      "#FF8844",
     ],
     [colors.strokeColor],
   );
@@ -63,33 +54,49 @@ export default function DrawingScreen() {
   // Available stroke widths
   const strokeWidths = [1, 3, 5, 8, 12];
 
-  const canvasHeight = screenHeight - insets.top - insets.bottom - 140; // Account for toolbar
+  const canvasHeight = screenHeight - insets.top - insets.bottom - 140;
 
-  // Simple path bounds calculation (simplified)
-  const getPathBounds = (pathString) => {
-    const coords = pathString.match(/\d+\.?\d*/g) || [];
-    const numbers = coords.map(Number);
+  // Helper to create smooth path from points
+  const createSmoothPath = useCallback((points) => {
+    if (points.length === 0) return null;
 
-    if (numbers.length < 2) return { centerX: 0, centerY: 0 };
+    const path = Skia.Path.Make();
 
-    let minX = numbers[0],
-      maxX = numbers[0];
-    let minY = numbers[1],
-      maxY = numbers[1];
-
-    for (let i = 2; i < numbers.length; i += 2) {
-      minX = Math.min(minX, numbers[i]);
-      maxX = Math.max(maxX, numbers[i]);
-      if (i + 1 < numbers.length) {
-        minY = Math.min(minY, numbers[i + 1]);
-        maxY = Math.max(maxY, numbers[i + 1]);
-      }
+    if (points.length === 1) {
+      const point = points[0];
+      path.addCircle(point.x, point.y, point.width / 2);
+      return path;
     }
 
-    return {
-      centerX: (minX + maxX) / 2,
-      centerY: (minY + maxY) / 2,
-    };
+    path.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length - 1; i++) {
+      const xc = (points[i].x + points[i + 1].x) / 2;
+      const yc = (points[i].y + points[i + 1].y) / 2;
+      path.quadTo(points[i].x, points[i].y, xc, yc);
+    }
+
+    if (points.length > 1) {
+      const lastPoint = points[points.length - 1];
+      path.lineTo(lastPoint.x, lastPoint.y);
+    }
+
+    return path;
+  }, []);
+
+  // Check if point is near path (for eraser)
+  const isPointNearPath = (x, y, pathData, eraserRadius) => {
+    if (!pathData.points || pathData.points.length === 0) return false;
+
+    for (let point of pathData.points) {
+      const distance = Math.sqrt(
+        Math.pow(x - point.x, 2) + Math.pow(y - point.y, 2)
+      );
+      if (distance < eraserRadius) {
+        return true;
+      }
+    }
+    return false;
   };
 
   // Save current drawing state
@@ -113,112 +120,109 @@ export default function DrawingScreen() {
     }
   }, [paths]);
 
-  // Handle pan gesture for drawing
-  const panGesture = Gesture.Pan()
+  // Drawing gesture handler
+  const drawingGesture = Gesture.Pan()
     .onStart((event) => {
-      setIsDrawing(true);
+      if (currentTool === "pen") {
+        const pressure = event.force || 0.5;
+        const adjustedWidth = strokeWidth * (0.5 + pressure);
 
-      // Start new path
-      const startX = event.x;
-      const startY = event.y;
-      currentPath.current = `M${startX},${startY}`;
+        currentPoints.current = [{
+          x: event.x,
+          y: event.y,
+          width: adjustedWidth,
+          pressure,
+        }];
 
-      currentStroke.current = {
-        color: strokeColor,
-        width: strokeWidth,
-        tool: currentTool,
-      };
-    })
-    .onUpdate((event) => {
-      if (currentTool === "eraser") return;
+        const path = Skia.Path.Make();
+        path.addCircle(event.x, event.y, adjustedWidth / 2);
 
-      // Add line to current path
-      const x = event.x;
-      const y = event.y;
-      currentPath.current += ` L${x},${y}`;
-
-      // Update paths in real-time for smooth drawing
-      setPaths((prev) => {
-        const newPaths = [...prev];
-        const currentPathData = {
-          path: currentPath.current,
-          color: currentStroke.current.color,
-          width: currentStroke.current.width,
-          tool: currentStroke.current.tool,
-        };
-
-        if (newPaths.length > 0 && newPaths[newPaths.length - 1].isTemp) {
-          newPaths[newPaths.length - 1] = { ...currentPathData, isTemp: true };
-        } else {
-          newPaths.push({ ...currentPathData, isTemp: true });
-        }
-
-        return newPaths;
-      });
-    })
-    .onEnd(() => {
-      setIsDrawing(false);
-
-      if (currentPath.current && currentTool !== "eraser") {
-        // Finalize the path
-        setPaths((prev) => {
-          // Save current state for undo
-          setUndoStack((prevUndo) => [
-            ...prevUndo,
-            prev.filter((p) => !p.isTemp),
-          ]);
-
-          const newPaths = prev.filter((p) => !p.isTemp);
-          newPaths.push({
-            path: currentPath.current,
-            color: currentStroke.current.color,
-            width: currentStroke.current.width,
-            tool: currentStroke.current.tool,
-            id: Date.now() + Math.random(),
-          });
-          return newPaths;
+        setCurrentDrawingPath({
+          path,
+          color: strokeColor,
+          width: strokeWidth,
         });
       }
-
-      currentPath.current = "";
-    });
-
-  // Handle eraser gesture
-  const eraserGesture = Gesture.Pan()
-    .enabled(currentTool === "eraser")
+    })
     .onUpdate((event) => {
-      const eraserRadius = strokeWidth * 3;
+      if (currentTool === "pen") {
+        const pressure = event.force || 0.5;
+        const adjustedWidth = strokeWidth * (0.5 + pressure);
 
-      setPaths((prev) => {
-        return prev.filter((pathData) => {
-          // Simple collision detection - check if eraser point intersects with path
-          // This is a simplified version - a more complex implementation would
-          // parse the SVG path and do proper geometric intersection
-          const pathBounds = getPathBounds(pathData.path);
-          const distance = Math.sqrt(
-            Math.pow(event.x - pathBounds.centerX, 2) +
-              Math.pow(event.y - pathBounds.centerY, 2),
-          );
-
-          return distance > eraserRadius;
+        currentPoints.current.push({
+          x: event.x,
+          y: event.y,
+          width: adjustedWidth,
+          pressure,
         });
-      });
-    });
 
-  // Combine gestures
-  const combinedGesture = Gesture.Race(panGesture, eraserGesture);
+        const path = createSmoothPath(currentPoints.current);
+
+        setCurrentDrawingPath({
+          path,
+          color: strokeColor,
+          width: strokeWidth,
+        });
+      } else if (currentTool === "eraser") {
+        const eraserRadius = strokeWidth * 3;
+
+        setPaths((prev) => {
+          const filtered = prev.filter((pathData) => {
+            return !isPointNearPath(event.x, event.y, pathData, eraserRadius);
+          });
+
+          if (filtered.length !== prev.length) {
+            setUndoStack((prevUndo) => [...prevUndo, prev]);
+            setRedoStack([]);
+          }
+
+          return filtered;
+        });
+      }
+    })
+    .onEnd(() => {
+      if (currentTool === "pen" && currentPoints.current.length > 0) {
+        const pathData = {
+          points: [...currentPoints.current],
+          color: strokeColor,
+          width: strokeWidth,
+          tool: currentTool,
+          id: Date.now() + Math.random(),
+        };
+
+        setPaths((prev) => {
+          setUndoStack((prevUndo) => [...prevUndo, prev]);
+          setRedoStack([]);
+          return [...prev, pathData];
+        });
+
+        currentPoints.current = [];
+        setCurrentDrawingPath(null);
+      }
+    });
 
   // Undo function
-  const handleUndo = () => {
+  const handleUndo = useCallback(() => {
     if (undoStack.length > 0) {
       const previousState = undoStack[undoStack.length - 1];
+      setRedoStack((prev) => [...prev, paths]);
       setPaths(previousState);
       setUndoStack((prev) => prev.slice(0, -1));
     }
-  };
+  }, [undoStack, paths]);
+
+  // Redo function
+  const handleRedo = useCallback(() => {
+    if (redoStack.length > 0) {
+      const nextState = redoStack[redoStack.length - 1];
+      setUndoStack((prev) => [...prev, paths]);
+      setPaths(nextState);
+      setRedoStack((prev) => prev.slice(0, -1));
+    }
+  }, [redoStack, paths]);
 
   // Clear canvas
-  const handleClear = () => {
+  const handleClear = useCallback(() => {
     Alert.alert(
       "Clear Canvas",
       "Are you sure you want to clear the entire drawing?",
@@ -229,14 +233,15 @@ export default function DrawingScreen() {
           style: "destructive",
           onPress: () => {
             setUndoStack((prev) => [...prev, paths]);
+            setRedoStack([]);
             setPaths([]);
           },
         },
       ],
     );
-  };
+  }, [paths]);
 
-  // Tool selection
+  // Tool selection button
   const ToolButton = ({ tool, icon: Icon, isActive, onPress }) => (
     <TouchableOpacity
       style={{
@@ -258,7 +263,7 @@ export default function DrawingScreen() {
     </TouchableOpacity>
   );
 
-  // Color picker
+  // Color picker button
   const ColorButton = ({ color, isActive, onPress }) => (
     <TouchableOpacity
       style={{
@@ -274,7 +279,7 @@ export default function DrawingScreen() {
     />
   );
 
-  // Stroke width selector
+  // Stroke width selector button
   const StrokeButton = ({ width, isActive, onPress }) => (
     <TouchableOpacity
       style={{
@@ -354,6 +359,30 @@ export default function DrawingScreen() {
                   width: 40,
                   height: 40,
                   borderRadius: 20,
+                  backgroundColor: colors.surfaceElevated,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  marginRight: 8,
+                }}
+                onPress={handleRedo}
+                disabled={redoStack.length === 0}
+              >
+                <Redo
+                  size={18}
+                  color={
+                    redoStack.length > 0
+                      ? colors.iconSecondary
+                      : colors.textTertiary
+                  }
+                  strokeWidth={1.5}
+                />
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={{
+                  width: 40,
+                  height: 40,
+                  borderRadius: 20,
                   backgroundColor: colors.primary,
                   alignItems: "center",
                   justifyContent: "center",
@@ -368,7 +397,7 @@ export default function DrawingScreen() {
 
         {/* Canvas */}
         <View style={{ flex: 1, backgroundColor: colors.canvasBackground }}>
-          <GestureDetector gesture={combinedGesture}>
+          <GestureDetector gesture={drawingGesture}>
             <Canvas
               style={{
                 width: screenWidth,
@@ -378,17 +407,35 @@ export default function DrawingScreen() {
             >
               <Fill color={colors.canvasBackground} />
               <Group>
-                {paths.map((pathData, index) => (
+                {/* Render saved paths */}
+                {paths.map((pathData, index) => {
+                  const path = createSmoothPath(pathData.points);
+                  if (!path) return null;
+
+                  return (
+                    <Path
+                      key={pathData.id || index}
+                      path={path}
+                      color={pathData.color}
+                      style="stroke"
+                      strokeWidth={pathData.width}
+                      strokeCap="round"
+                      strokeJoin="round"
+                    />
+                  );
+                })}
+
+                {/* Render current drawing path */}
+                {currentDrawingPath && currentDrawingPath.path && (
                   <Path
-                    key={pathData.id || index}
-                    path={pathData.path}
-                    color={pathData.color}
+                    path={currentDrawingPath.path}
+                    color={currentDrawingPath.color}
                     style="stroke"
-                    strokeWidth={pathData.width}
+                    strokeWidth={currentDrawingPath.width}
                     strokeCap="round"
                     strokeJoin="round"
                   />
-                ))}
+                )}
               </Group>
             </Canvas>
           </GestureDetector>
